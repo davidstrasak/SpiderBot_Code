@@ -46,8 +46,9 @@
 /* Servos --------------------------------------------------------------------*/
 // define 12 servos for 4 legs
 Servo servo[4][3];
-// define servos' ports - femur, tibia & coxa
-const int servo_pin[4][3] = {{3, 4, 2}, {6, 7, 5}, {9, 10, 8}, {12, 13, 11}};
+// define servos' ports - femur, tibia, coxa
+const int servo_pin[4][3] = {
+    {15, 2, 4}, {16, 17, 5}, {18, 19, 21}, {22, 23, 27}};
 /* Size of the robot ---------------------------------------------------------*/
 const float length_a = 100;
 const float length_b = 110;
