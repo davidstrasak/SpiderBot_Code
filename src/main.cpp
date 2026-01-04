@@ -40,15 +40,18 @@
 /* Includes
  * -------------------------------------------------------------------*/
 #include <Arduino.h>
-#include <FlexiTimer2.h>  //to set a timer to manage all servos
-#include <Servo.h>        //to define and control servos
-#include <avr/io.h>       //to read how much memory is left
+#include <ESP32Servo.h>  //ESP32 servo library to define and control servos
 /* Servos --------------------------------------------------------------------*/
 // define 12 servos for 4 legs
 Servo servo[4][3];
 // define servos' ports - femur, tibia, coxa
 const int servo_pin[4][3] = {
     {15, 2, 4}, {16, 17, 5}, {18, 19, 21}, {22, 23, 27}};
+
+/* ESP32 Servo Timing
+ * -------------------------------------------------------*/
+unsigned long last_servo_update = 0;
+const unsigned long servo_update_interval = 20;  // 20ms = 50Hz
 /* Size of the robot ---------------------------------------------------------*/
 const float length_a = 100;
 const float length_b = 110;
@@ -145,10 +148,18 @@ void setup() {
          site_now[i][j] = site_expect[i][j];
       }
    }
-   // start servo service
-   FlexiTimer2::set(20, servo_service);
-   FlexiTimer2::start();
-   Serial.println("Servo service started");
+
+   // Position servos to initial coordinates
+   float alpha, beta, gamma;
+   for (int i = 0; i < 4; i++) {
+      cartesian_to_polar(alpha, beta, gamma, site_now[i][0], site_now[i][1],
+                         site_now[i][2]);
+      polar_to_servo(i, alpha, beta, gamma);
+   }
+
+   // Initialize servo service timing
+   last_servo_update = millis();
+   Serial.println("Servo service timing initialized");
    Serial.println("Robot initialization Complete");
    Serial.print("Free RAM (End of setup): ");
    Serial.println(freeMemory());  // About 1367 left after setup
@@ -167,12 +178,12 @@ void loop() {
    Serial.println("Step back");
    step_back(5);
    delay(2000);
-   // Serial.println("Turn left");
-   // turn_left(5);
-   // delay(2000);
-   // Serial.println("Turn right");
-   // turn_right(5);
-   // delay(2000);
+   Serial.println("Turn left");
+   turn_left(5);
+   delay(2000);
+   Serial.println("Turn right");
+   turn_right(5);
+   delay(2000);
    Serial.println("Hand wave");
    hand_wave(3);
    delay(2000);
@@ -192,9 +203,17 @@ void loop() {
  * @warning blocking function due to delays
  */
 void servo_attach(void) {
+   // Allocate timers 0-3 for ESP32Servo library (avoids conflict with our timer
+   // 1)
+   ESP32PWM::allocateTimer(0);
+   ESP32PWM::allocateTimer(1);
+   ESP32PWM::allocateTimer(2);
+   ESP32PWM::allocateTimer(3);
+
    for (int i = 0; i < 4; i++) {
       for (int j = 0; j < 3; j++) {
-         servo[i][j].attach(servo_pin[i][j]);
+         servo[i][j].attach(servo_pin[i][j], 500,
+                            2500);  // min 500us, max 2500us
          delay(100);
       }
    }
@@ -694,7 +713,6 @@ void body_dance(int i) {
  */
 #define E_DELTA 0.01
 void servo_service(void) {
-   sei();
    static float alpha, beta, gamma;
 
    for (int i = 0; i < 4; i++) {
@@ -744,13 +762,20 @@ void set_site(int leg, float x, float y, float z) {
 /**
  * @brief wait for one end point to reach expected site
  * @warning blocking function
- * @param leg leg number (0-3)
- */
+ * @param leg leg number (0-3)  */
 void wait_reach(int leg) {
-   while (1)
+   while (1) {
+      // Call servo_service every 20ms to update servo positions
+      unsigned long current_time = millis();
+      if (current_time - last_servo_update >= servo_update_interval) {
+         servo_service();
+         last_servo_update = current_time;
+      }
+
       if (site_now[leg][0] == site_expect[leg][0])
          if (site_now[leg][1] == site_expect[leg][1])
             if (site_now[leg][2] == site_expect[leg][2]) break;
+   }
 }
 
 /**
@@ -824,24 +849,11 @@ void polar_to_servo(int leg, float alpha, float beta, float gamma) {
 }
 
 /**
- * @brief Calculates and returns the available free SRAM in bytes.
- * Works by measuring the space between the Hardware Stack Pointer (SP)
- * and the end of the Heap (__brkval or __malloc_heap_end).
- * @return int: Number of free bytes.
+ * @brief Calculates and returns the available free heap memory in bytes.
+ * Uses ESP32's built-in heap management function.
+ * @return int: Number of free bytes in heap.
  */
-int freeMemory() {
-   extern int __heap_start, *__brkval;
-   int v;
-   // If __brkval is NULL, the heap hasn't grown yet; use the heap start address
-   if ((int)__brkval == 0) {
-      return (int)&v - (int)&__heap_start;
-   }
-   // Otherwise, calculate the space between the current stack (address of v)
-   // and the end of the heap (__brkval).
-   else {
-      return (int)&v - (int)__brkval;
-   }
-}
+int freeMemory() { return ESP.getFreeHeap(); }
 
 /**
  * @brief Inifinite loop function to adjust legs to correct positions.
