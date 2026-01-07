@@ -750,9 +750,17 @@ void set_site(int leg, float x, float y, float z) {
 
    float length = sqrt(pow(length_x, 2) + pow(length_y, 2) + pow(length_z, 2));
 
-   temp_speed[leg][0] = length_x / length * move_speed * speed_multiple;
-   temp_speed[leg][1] = length_y / length * move_speed * speed_multiple;
-   temp_speed[leg][2] = length_z / length * move_speed * speed_multiple;
+   // Prevent division by zero when leg is already at target position
+   if (length > 0.001) {
+      temp_speed[leg][0] = length_x / length * move_speed * speed_multiple;
+      temp_speed[leg][1] = length_y / length * move_speed * speed_multiple;
+      temp_speed[leg][2] = length_z / length * move_speed * speed_multiple;
+   } else {
+      // No movement needed - set speeds to zero
+      temp_speed[leg][0] = 0;
+      temp_speed[leg][1] = 0;
+      temp_speed[leg][2] = 0;
+   }
 
    if (x != KEEP) site_expect[leg][0] = x;
    if (y != KEEP) site_expect[leg][1] = y;
