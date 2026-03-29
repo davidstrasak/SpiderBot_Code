@@ -41,6 +41,8 @@
  * -------------------------------------------------------------------*/
 #include <Arduino.h>
 #include <ESP32Servo.h>  //ESP32 servo library to define and control servos
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 /* Servos --------------------------------------------------------------------*/
 // define 12 servos for 4 legs
 Servo servo[4][3];
@@ -50,7 +52,6 @@ const int servo_pin[4][3] = {
 
 /* ESP32 Servo Timing
  * -------------------------------------------------------*/
-unsigned long last_servo_update = 0;
 const unsigned long servo_update_interval = 20;  // 20ms = 50Hz
 /* Size of the robot ---------------------------------------------------------*/
 const float length_a = 100;
@@ -69,12 +70,15 @@ volatile float site_expect[4]
                           [3];  // expected coordinates of the end of each leg
 float temp_speed[4][3];  // each axis' speed, needs to be recalculated before
 // each movement
-float move_speed;          // movement speed
-float speed_multiple = 1;  // movement speed multiple
+float move_speed;  // movement speed
+const float startup_speed = 1;
 const float spot_turn_speed = 4;
 const float leg_move_speed = 8;
 const float body_move_speed = 3;
 const float stand_seat_speed = 1;
+const float x_neutral_90 = length_a + length_c;
+const float y_neutral_90 = y_start;
+const float z_neutral_90 = -length_b;
 volatile int rest_counter;  //+1/0.02s, for automatic rest
 // functions' parameter
 const float KEEP = 255;
@@ -121,6 +125,18 @@ void cartesian_to_polar(volatile float& alpha, volatile float& beta,
 void polar_to_servo(int leg, float alpha, float beta, float gamma);
 int freeMemory(void);
 void adjust(void);
+void initialize_neutral_servo_pose(void);
+
+// RTOS tasks
+void servo_service_task(void* parameter);
+void robot_control_task(void* parameter);
+void led_blink_task(void* parameter);
+
+TaskHandle_t servo_task_handle = nullptr;
+TaskHandle_t robot_task_handle = nullptr;
+TaskHandle_t led_task_handle = nullptr;
+const uint16_t kBackgroundTaskPeriodMs = 250;
+portMUX_TYPE motion_state_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /**
  * @brief initialize the robot's default parameters, servo service, and servos
@@ -135,67 +151,122 @@ void setup() {
    servo_attach();
    Serial.println("Servos initialized");
 
+   // Command a known neutral angle on every servo at startup.
+   initialize_neutral_servo_pose();
+   Serial.println("Neutral 90-degree servo pose applied");
+
    // Optional adjust position of the servos
    //  adjust();
 
+   // Sync model state to the known physical neutral servo command (90 deg).
+   for (int leg = 0; leg < 4; leg++) {
+      site_now[leg][0] = x_neutral_90;
+      site_now[leg][1] = y_neutral_90;
+      site_now[leg][2] = z_neutral_90;
+      site_expect[leg][0] = x_neutral_90;
+      site_expect[leg][1] = y_neutral_90;
+      site_expect[leg][2] = z_neutral_90;
+   }
+
+   // Start dedicated 20ms servo service task before first motion transition.
+   xTaskCreatePinnedToCore(servo_service_task, "servo_service_task", 4096,
+                           nullptr, 3, &servo_task_handle, 0);
+
+   // Slow startup transition from neutral 90-degree pose to boot pose.
+   move_speed = startup_speed;
+
    // initialize default parameter
+   // Since the servo_service task is already running, the legs move to this
+   // position
    set_site(0, x_default - x_offset, y_start + y_step, z_boot);
    set_site(1, x_default - x_offset, y_start + y_step, z_boot);
    set_site(2, x_default + x_offset, y_start, z_boot);
    set_site(3, x_default + x_offset, y_start, z_boot);
-   for (int i = 0; i < 4; i++) {
-      for (int j = 0; j < 3; j++) {
-         site_now[i][j] = site_expect[i][j];
-      }
-   }
+   // Wait for all servos to reach boot position gradually before starting tasks
+   wait_all_reach();
 
-   // Position servos to initial coordinates
-   float alpha, beta, gamma;
-   for (int i = 0; i < 4; i++) {
-      cartesian_to_polar(alpha, beta, gamma, site_now[i][0], site_now[i][1],
-                         site_now[i][2]);
-      polar_to_servo(i, alpha, beta, gamma);
-   }
+   Serial.println("Servo service task started (20ms)");
 
-   // Initialize servo service timing
-   last_servo_update = millis();
-   Serial.println("Servo service timing initialized");
+   Serial.println("Boot position reached");
    Serial.println("Robot initialization Complete");
    Serial.print("Free RAM (End of setup): ");
    Serial.println(freeMemory());  // About 1367 left after setup
+
+   xTaskCreatePinnedToCore(robot_control_task, "robot_control_task", 8192,
+                           nullptr, 2, &robot_task_handle, 1);
+
+   xTaskCreatePinnedToCore(led_blink_task, "led_blink_task", 2048, nullptr, 1,
+                           &led_task_handle, 0);
 }
 
 /**
  * @brief main loop demonstrating robot movements and actions
  */
-void loop() {
-   Serial.println("Stand");
-   stand();
-   delay(2000);
-   Serial.println("Step forward");
-   step_forward(5);
-   delay(2000);
-   Serial.println("Step back");
-   step_back(5);
-   delay(2000);
-   Serial.println("Turn left");
-   turn_left(5);
-   delay(2000);
-   Serial.println("Turn right");
-   turn_right(5);
-   delay(2000);
-   Serial.println("Hand wave");
-   hand_wave(3);
-   delay(2000);
-   Serial.println("Hand wave");
-   hand_shake(3);
-   delay(2000);
-   Serial.println("Body dance");
-   body_dance(10);
-   delay(2000);
-   Serial.println("Sit");
-   sit();
-   delay(5000);
+void loop() { vTaskDelay(portMAX_DELAY); }
+
+void initialize_neutral_servo_pose(void) {
+   for (int leg = 0; leg < 4; leg++) {
+      for (int joint = 0; joint < 3; joint++) {
+         servo[leg][joint].write(90);
+         delay(20);
+      }
+   }
+   delay(300);
+}
+
+void servo_service_task(void* parameter) {
+   (void)parameter;
+
+   TickType_t last_wake = xTaskGetTickCount();
+   const TickType_t period_ticks = pdMS_TO_TICKS(servo_update_interval);
+
+   while (true) {
+      servo_service();
+      vTaskDelayUntil(&last_wake, period_ticks);
+   }
+}
+
+void robot_control_task(void* parameter) {
+   (void)parameter;
+
+   while (true) {
+      Serial.println("Stand");
+      stand();
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      Serial.println("Step forward");
+      step_forward(5);
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      Serial.println("Step back");
+      step_back(5);
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      Serial.println("Turn left");
+      turn_left(5);
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      Serial.println("Turn right");
+      turn_right(5);
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      Serial.println("Hand wave");
+      hand_wave(3);
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      Serial.println("Hand wave");
+      hand_shake(3);
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      Serial.println("Body dance");
+      body_dance(10);
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      Serial.println("Sit");
+      sit();
+      vTaskDelay(pdMS_TO_TICKS(5000));
+   }
+}
+
+void led_blink_task(void* parameter) {
+   (void)parameter;
+
+   while (true) {
+      // Reserved background task slot for future Bluetooth handling.
+      vTaskDelay(pdMS_TO_TICKS(kBackgroundTaskPeriodMs));
+   }
 }
 
 /**
@@ -714,22 +785,47 @@ void body_dance(int i) {
 #define E_DELTA 0.01
 void servo_service(void) {
    static float alpha, beta, gamma;
+   float local_site_now[4][3];
+   float local_site_expect[4][3];
+   float local_temp_speed[4][3];
+
+   portENTER_CRITICAL(&motion_state_mux);
 
    for (int i = 0; i < 4; i++) {
       for (int j = 0; j < 3; j++) {
-         if (abs(site_now[i][j] - site_expect[i][j]) <
-             (abs(temp_speed[i][j]) + E_DELTA))
-            site_now[i][j] = site_expect[i][j];
-         else
-            site_now[i][j] += temp_speed[i][j];
+         local_site_now[i][j] = site_now[i][j];
+         local_site_expect[i][j] = site_expect[i][j];
+         local_temp_speed[i][j] = temp_speed[i][j];
+      }
+   }
+
+   portEXIT_CRITICAL(&motion_state_mux);
+
+   for (int i = 0; i < 4; i++) {
+      for (int j = 0; j < 3; j++) {
+         if (abs(local_site_now[i][j] - local_site_expect[i][j]) <
+             (abs(local_temp_speed[i][j]) + E_DELTA)) {
+            local_site_now[i][j] = local_site_expect[i][j];
+         } else {
+            local_site_now[i][j] += local_temp_speed[i][j];
+         }
       }
 
-      cartesian_to_polar(alpha, beta, gamma, site_now[i][0], site_now[i][1],
-                         site_now[i][2]);
+      cartesian_to_polar(alpha, beta, gamma, local_site_now[i][0],
+                         local_site_now[i][1], local_site_now[i][2]);
       polar_to_servo(i, alpha, beta, gamma);
    }
 
+   portENTER_CRITICAL(&motion_state_mux);
+
+   for (int i = 0; i < 4; i++) {
+      for (int j = 0; j < 3; j++) {
+         site_now[i][j] = local_site_now[i][j];
+      }
+   }
+
    rest_counter++;
+   portEXIT_CRITICAL(&motion_state_mux);
 }
 
 /**
@@ -742,6 +838,8 @@ void servo_service(void) {
  * @note this function will set temp_speed[4][3] at the same time
  */
 void set_site(int leg, float x, float y, float z) {
+   portENTER_CRITICAL(&motion_state_mux);
+
    float length_x = 0, length_y = 0, length_z = 0;
 
    if (x != KEEP) length_x = x - site_now[leg][0];
@@ -752,9 +850,9 @@ void set_site(int leg, float x, float y, float z) {
 
    // Prevent division by zero when leg is already at target position
    if (length > 0.001) {
-      temp_speed[leg][0] = length_x / length * move_speed * speed_multiple;
-      temp_speed[leg][1] = length_y / length * move_speed * speed_multiple;
-      temp_speed[leg][2] = length_z / length * move_speed * speed_multiple;
+      temp_speed[leg][0] = length_x / length * move_speed;
+      temp_speed[leg][1] = length_y / length * move_speed;
+      temp_speed[leg][2] = length_z / length * move_speed;
    } else {
       // No movement needed - set speeds to zero
       temp_speed[leg][0] = 0;
@@ -765,6 +863,8 @@ void set_site(int leg, float x, float y, float z) {
    if (x != KEEP) site_expect[leg][0] = x;
    if (y != KEEP) site_expect[leg][1] = y;
    if (z != KEEP) site_expect[leg][2] = z;
+
+   portEXIT_CRITICAL(&motion_state_mux);
 }
 
 /**
@@ -773,16 +873,17 @@ void set_site(int leg, float x, float y, float z) {
  * @param leg leg number (0-3)  */
 void wait_reach(int leg) {
    while (1) {
-      // Call servo_service every 20ms to update servo positions
-      unsigned long current_time = millis();
-      if (current_time - last_servo_update >= servo_update_interval) {
-         servo_service();
-         last_servo_update = current_time;
-      }
+      bool reached = false;
+      portENTER_CRITICAL(&motion_state_mux);
+      reached = (site_now[leg][0] == site_expect[leg][0]) &&
+                (site_now[leg][1] == site_expect[leg][1]) &&
+                (site_now[leg][2] == site_expect[leg][2]);
+      portEXIT_CRITICAL(&motion_state_mux);
 
-      if (site_now[leg][0] == site_expect[leg][0])
-         if (site_now[leg][1] == site_expect[leg][1])
-            if (site_now[leg][2] == site_expect[leg][2]) break;
+      if (reached) break;
+
+      // Yield so the scheduler can run servo_service_task reliably.
+      vTaskDelay(pdMS_TO_TICKS(1));
    }
 }
 
