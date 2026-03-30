@@ -71,104 +71,6 @@ QueueHandle_t bleCommandQueue;
 bool deviceConnected = false;
 NimBLECharacteristic* pTxCharacteristic = nullptr;
 
-class MyServerCallbacks : public NimBLEServerCallbacks {
-   void onConnect(NimBLEServer* pServer) {
-      deviceConnected = true;
-      Serial.println("BLE Client Connected");
-   }
-
-   void onDisconnect(NimBLEServer* pServer) {
-      deviceConnected = false;
-      Serial.println("BLE Client Disconnected");
-      // Adv on disconnect
-      pServer->startAdvertising();
-      // Send stop so it doesn't keep moving
-      RobotCommand cmd = CMD_STOP;
-      xQueueSend(bleCommandQueue, &cmd, 0);
-   }
-};
-
-class MyCallbacks : public NimBLECharacteristicCallbacks {
-   void onWrite(NimBLECharacteristic* pCharacteristic) {
-      std::string rxValue = pCharacteristic->getValue();
-
-      if (rxValue.length() > 0) {
-         Serial.print("Received Value: ");
-         for (int i = 0; i < rxValue.length(); i++) {
-            Serial.print(rxValue[i]);
-         }
-         Serial.println();
-
-         char commandChar = rxValue[0];
-         RobotCommand cmd = CMD_STOP;
-
-         switch (commandChar) {
-            case 'F':
-               cmd = CMD_FORWARD;
-               break;
-            case 'B':
-               cmd = CMD_BACKWARD;
-               break;
-            case 'L':
-               cmd = CMD_LEFT;
-               break;
-            case 'R':
-               cmd = CMD_RIGHT;
-               break;
-            case 'W':
-               cmd = CMD_WAVE;
-               break;
-            case 'D':
-               cmd = CMD_DANCE;
-               break;
-            case 'S':
-               cmd = CMD_STOP;
-               break;
-            case 'U':
-               cmd = CMD_STAND;
-               break;
-            case 'I':
-               cmd = CMD_SIT;
-               break;
-            default:
-               cmd = CMD_STOP;
-               break;
-         }
-
-         // Pass command to FreeRTOS queue safely
-         xQueueSend(bleCommandQueue, &cmd, 0);
-      }
-   }
-};
-
-void initBLE() {
-   // Initialize FreeRTOS Queue for passing commands
-   bleCommandQueue = xQueueCreate(10, sizeof(RobotCommand));
-
-   NimBLEDevice::init("SpiderBot_BLE");
-   NimBLEServer* pServer = NimBLEDevice::createServer();
-   pServer->setCallbacks(new MyServerCallbacks());
-
-   NimBLEService* pService = pServer->createService(SERVICE_UUID);
-
-   pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX,
-                                                      NIMBLE_PROPERTY::NOTIFY);
-
-   NimBLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
-       CHARACTERISTIC_UUID_RX,
-       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
-
-   pRxCharacteristic->setCallbacks(new MyCallbacks());
-
-   pService->start();
-
-   NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
-   pAdvertising->addServiceUUID(SERVICE_UUID);
-   pAdvertising->setScanResponse(true);
-   pAdvertising->start();
-   Serial.println("BLE Initialization complete. Waiting for connections...");
-}
-
 /* Servos --------------------------------------------------------------------*/
 // define 12 servos for 4 legs
 Servo servo[4][3];
@@ -261,6 +163,7 @@ void polar_to_servo(int leg, float alpha, float beta, float gamma);
 int freeMemory(void);
 void adjust(void);
 void initialize_neutral_servo_pose(void);
+void initBLE(void);
 
 // RTOS tasks
 void servo_service_task(void* parameter);
@@ -1136,4 +1039,102 @@ void adjust(void) {
          }
       }
    }
+}
+
+class MyServerCallbacks : public NimBLEServerCallbacks {
+   void onConnect(NimBLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("BLE Client Connected");
+   }
+
+   void onDisconnect(NimBLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("BLE Client Disconnected");
+      // Adv on disconnect
+      pServer->startAdvertising();
+      // Send stop so it doesn't keep moving
+      RobotCommand cmd = CMD_STOP;
+      xQueueSend(bleCommandQueue, &cmd, 0);
+   }
+};
+
+class MyCallbacks : public NimBLECharacteristicCallbacks {
+   void onWrite(NimBLECharacteristic* pCharacteristic) {
+      std::string rxValue = pCharacteristic->getValue();
+
+      if (rxValue.length() > 0) {
+         Serial.print("Received Value: ");
+         for (int i = 0; i < rxValue.length(); i++) {
+            Serial.print(rxValue[i]);
+         }
+         Serial.println();
+
+         char commandChar = rxValue[0];
+         RobotCommand cmd = CMD_STOP;
+
+         switch (commandChar) {
+            case 'F':
+               cmd = CMD_FORWARD;
+               break;
+            case 'B':
+               cmd = CMD_BACKWARD;
+               break;
+            case 'L':
+               cmd = CMD_LEFT;
+               break;
+            case 'R':
+               cmd = CMD_RIGHT;
+               break;
+            case 'W':
+               cmd = CMD_WAVE;
+               break;
+            case 'D':
+               cmd = CMD_DANCE;
+               break;
+            case 'S':
+               cmd = CMD_STOP;
+               break;
+            case 'U':
+               cmd = CMD_STAND;
+               break;
+            case 'I':
+               cmd = CMD_SIT;
+               break;
+            default:
+               cmd = CMD_STOP;
+               break;
+         }
+
+         // Pass command to FreeRTOS queue safely
+         xQueueSend(bleCommandQueue, &cmd, 0);
+      }
+   }
+};
+
+void initBLE() {
+   // Initialize FreeRTOS Queue for passing commands
+   bleCommandQueue = xQueueCreate(10, sizeof(RobotCommand));
+
+   NimBLEDevice::init("SpiderBot_BLE");
+   NimBLEServer* pServer = NimBLEDevice::createServer();
+   pServer->setCallbacks(new MyServerCallbacks());
+
+   NimBLEService* pService = pServer->createService(SERVICE_UUID);
+
+   pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX,
+                                                      NIMBLE_PROPERTY::NOTIFY);
+
+   NimBLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
+       CHARACTERISTIC_UUID_RX,
+       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+
+   pRxCharacteristic->setCallbacks(new MyCallbacks());
+
+   pService->start();
+
+   NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+   pAdvertising->addServiceUUID(SERVICE_UUID);
+   pAdvertising->setScanResponse(true);
+   pAdvertising->start();
+   Serial.println("BLE Initialization complete. Waiting for connections...");
 }
