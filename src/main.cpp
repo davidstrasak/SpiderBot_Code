@@ -91,14 +91,14 @@ const float COXA_MAX_ANGLE = 180.0;
  * -------------------------------------------------------*/
 const unsigned long servo_update_interval = 20;  // 20ms = 50Hz
 /* Size of the robot ---------------------------------------------------------*/
-const float length_a = 100;
-const float length_b = 110;
+const float length_a = 55;
+const float length_b = 77.5;
 const float length_c = 27.5;
 const float length_side = 71;
 const float z_absolute = -28;
 /* Constants for movement ----------------------------------------------------*/
 const float z_default = -50, z_up = -30, z_boot = z_absolute;
-const float x_default = 62, x_offset = 10;
+const float x_default = 62, x_offset = 0;
 const float y_start = 0, y_step = 40;
 const float y_default = x_default;
 /* variables for movement ----------------------------------------------------*/
@@ -210,18 +210,7 @@ void setup() {
    xTaskCreatePinnedToCore(servo_service_task, "servo_service_task", 4096,
                            nullptr, 3, &servo_task_handle, 0);
 
-   // Slow startup transition from neutral 90-degree pose to boot pose.
-   move_speed = startup_speed;
-
-   // initialize default parameter
-   // Since the servo_service task is already running, the legs move to this
-   // position
-   set_site(0, x_default - x_offset, y_start + y_step, z_boot);
-   set_site(1, x_default - x_offset, y_start + y_step, z_boot);
-   set_site(2, x_default + x_offset, y_start, z_boot);
-   set_site(3, x_default + x_offset, y_start, z_boot);
-   // Wait for all servos to reach boot position gradually before starting tasks
-   wait_all_reach();
+   stand();
 
    Serial.println("Servo service task started (20ms)");
 
