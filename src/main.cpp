@@ -41,14 +41,149 @@
  * -------------------------------------------------------------------*/
 #include <Arduino.h>
 #include <ESP32Servo.h>  //ESP32 servo library to define and control servos
+#include <NimBLEDevice.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <freertos/task.h>
+
+// BLE UUIDs for Nordic UART Service
+#define SERVICE_UUID \
+   "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"  // UART service UUID
+#define CHARACTERISTIC_UUID_RX \
+   "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // RX characteristic UIID
+#define CHARACTERISTIC_UUID_TX \
+   "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // TX characteristic UUID
+
+// Define robot commands
+enum RobotCommand {
+   CMD_STOP,
+   CMD_FORWARD,
+   CMD_BACKWARD,
+   CMD_LEFT,
+   CMD_RIGHT,
+   CMD_WAVE,
+   CMD_DANCE,
+   CMD_STAND,
+   CMD_SIT
+};
+
+QueueHandle_t bleCommandQueue;
+bool deviceConnected = false;
+NimBLECharacteristic* pTxCharacteristic = nullptr;
+
+class MyServerCallbacks : public NimBLEServerCallbacks {
+   void onConnect(NimBLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("BLE Client Connected");
+   }
+
+   void onDisconnect(NimBLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("BLE Client Disconnected");
+      // Adv on disconnect
+      pServer->startAdvertising();
+      // Send stop so it doesn't keep moving
+      RobotCommand cmd = CMD_STOP;
+      xQueueSend(bleCommandQueue, &cmd, 0);
+   }
+};
+
+class MyCallbacks : public NimBLECharacteristicCallbacks {
+   void onWrite(NimBLECharacteristic* pCharacteristic) {
+      std::string rxValue = pCharacteristic->getValue();
+
+      if (rxValue.length() > 0) {
+         Serial.print("Received Value: ");
+         for (int i = 0; i < rxValue.length(); i++) {
+            Serial.print(rxValue[i]);
+         }
+         Serial.println();
+
+         char commandChar = rxValue[0];
+         RobotCommand cmd = CMD_STOP;
+
+         switch (commandChar) {
+            case 'F':
+               cmd = CMD_FORWARD;
+               break;
+            case 'B':
+               cmd = CMD_BACKWARD;
+               break;
+            case 'L':
+               cmd = CMD_LEFT;
+               break;
+            case 'R':
+               cmd = CMD_RIGHT;
+               break;
+            case 'W':
+               cmd = CMD_WAVE;
+               break;
+            case 'D':
+               cmd = CMD_DANCE;
+               break;
+            case 'S':
+               cmd = CMD_STOP;
+               break;
+            case 'U':
+               cmd = CMD_STAND;
+               break;
+            case 'I':
+               cmd = CMD_SIT;
+               break;
+            default:
+               cmd = CMD_STOP;
+               break;
+         }
+
+         // Pass command to FreeRTOS queue safely
+         xQueueSend(bleCommandQueue, &cmd, 0);
+      }
+   }
+};
+
+void initBLE() {
+   // Initialize FreeRTOS Queue for passing commands
+   bleCommandQueue = xQueueCreate(10, sizeof(RobotCommand));
+
+   NimBLEDevice::init("SpiderBot_BLE");
+   NimBLEServer* pServer = NimBLEDevice::createServer();
+   pServer->setCallbacks(new MyServerCallbacks());
+
+   NimBLEService* pService = pServer->createService(SERVICE_UUID);
+
+   pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX,
+                                                      NIMBLE_PROPERTY::NOTIFY);
+
+   NimBLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
+       CHARACTERISTIC_UUID_RX,
+       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+
+   pRxCharacteristic->setCallbacks(new MyCallbacks());
+
+   pService->start();
+
+   NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+   pAdvertising->addServiceUUID(SERVICE_UUID);
+   pAdvertising->setScanResponse(true);
+   pAdvertising->start();
+   Serial.println("BLE Initialization complete. Waiting for connections...");
+}
+
 /* Servos --------------------------------------------------------------------*/
 // define 12 servos for 4 legs
 Servo servo[4][3];
 // define servos' ports - femur, tibia, coxa
 const int servo_pin[4][3] = {
     {15, 2, 4}, {16, 17, 5}, {18, 19, 21}, {22, 23, 27}};
+
+// Constraints for tibia servos (leg joints 2, 17, 19, 23) to avoid physical
+// limits
+const float TIBIA_MIN_ANGLE = 45.0;
+const float TIBIA_MAX_ANGLE = 135.0;
+const float FEMUR_MIN_ANGLE = 0.0;
+const float FEMUR_MAX_ANGLE = 180.0;
+const float COXA_MIN_ANGLE = 0.0;
+const float COXA_MAX_ANGLE = 180.0;
 
 /* ESP32 Servo Timing
  * -------------------------------------------------------*/
@@ -61,7 +196,7 @@ const float length_side = 71;
 const float z_absolute = -28;
 /* Constants for movement ----------------------------------------------------*/
 const float z_default = -50, z_up = -30, z_boot = z_absolute;
-const float x_default = 62, x_offset = 0;
+const float x_default = 62, x_offset = 10;
 const float y_start = 0, y_step = 40;
 const float y_default = x_default;
 /* variables for movement ----------------------------------------------------*/
@@ -229,34 +364,52 @@ void servo_service_task(void* parameter) {
 void robot_control_task(void* parameter) {
    (void)parameter;
 
+   // Make sure initBLE() is called before this task starts processing commands
+   initBLE();
+
+   RobotCommand currentCommand = CMD_STOP;
+
    while (true) {
-      Serial.println("Stand");
-      stand();
-      vTaskDelay(pdMS_TO_TICKS(2000));
-      Serial.println("Step forward");
-      step_forward(5);
-      vTaskDelay(pdMS_TO_TICKS(2000));
-      Serial.println("Step back");
-      step_back(5);
-      vTaskDelay(pdMS_TO_TICKS(2000));
-      Serial.println("Turn left");
-      turn_left(5);
-      vTaskDelay(pdMS_TO_TICKS(2000));
-      Serial.println("Turn right");
-      turn_right(5);
-      vTaskDelay(pdMS_TO_TICKS(2000));
-      Serial.println("Hand wave");
-      hand_wave(3);
-      vTaskDelay(pdMS_TO_TICKS(2000));
-      Serial.println("Hand wave");
-      hand_shake(3);
-      vTaskDelay(pdMS_TO_TICKS(2000));
-      Serial.println("Body dance");
-      body_dance(10);
-      vTaskDelay(pdMS_TO_TICKS(2000));
-      Serial.println("Sit");
-      sit();
-      vTaskDelay(pdMS_TO_TICKS(5000));
+      if (xQueueReceive(bleCommandQueue, &currentCommand, pdMS_TO_TICKS(100)) ==
+          pdPASS) {
+         Serial.print("Executing BLE Command: ");
+         Serial.println(currentCommand);
+
+         switch (currentCommand) {
+            case CMD_FORWARD:
+               step_forward(1);
+               break;
+            case CMD_BACKWARD:
+               step_back(1);
+               break;
+            case CMD_LEFT:
+               turn_left(1);
+               break;
+            case CMD_RIGHT:
+               turn_right(1);
+               break;
+            case CMD_WAVE:
+               hand_wave(1);
+               break;
+            case CMD_DANCE:
+               body_dance(1);
+               break;
+            case CMD_STAND:
+               stand();
+               break;
+            case CMD_SIT:
+               sit();
+               break;
+            case CMD_STOP:
+            default:
+               // Stay in place, no further action for now
+               break;
+         }
+      } else {
+         // No command received from BLE yet, just yield to allow other tasks to
+         // run
+         vTaskDelay(pdMS_TO_TICKS(10));
+      }
    }
 }
 
@@ -934,6 +1087,12 @@ void cartesian_to_polar(volatile float& alpha, volatile float& beta,
  * @note mathematical model mapped to physical implementation
  */
 void polar_to_servo(int leg, float alpha, float beta, float gamma) {
+   // Constrain physical angles BEFORE translating into mirrored servo mappings
+   // The user constraints apply to the actual physical angles:
+   beta = constrain(beta, TIBIA_MIN_ANGLE, TIBIA_MAX_ANGLE);
+   alpha = constrain(alpha, FEMUR_MIN_ANGLE, FEMUR_MAX_ANGLE);
+   gamma = constrain(gamma, COXA_MIN_ANGLE, COXA_MAX_ANGLE);
+
    if (leg == 0) {
       alpha = 90 - alpha;
       beta = beta;
